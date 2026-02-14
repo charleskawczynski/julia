@@ -81,6 +81,28 @@ function Base_makeproper(io::IO, @nospecialize(x::Type))
     return x
 end
 
+# ── alias candidate cache ──────────────────────────────────────────────
+# Iterating unsorted_names(mod) + isdefinedglobal / isconst / getglobal
+# for every call to Base_make_typealias is O(|module|) and dominates
+# the cost for large modules like Base (~130 μs for 1215 names).
+# Cache the small set of candidates (~30 for Base) on first access.
+const _typealias_candidates = Dict{Module, Vector{Tuple{Symbol, Any}}}()
+
+function _get_typealias_candidates(mod::Module)
+    return get!(_typealias_candidates, mod) do
+        candidates = Tuple{Symbol, Any}[]
+        for name in unsorted_names(mod)
+            if isdefinedglobal(mod, name) && isconst(mod, name)
+                alias = getglobal(mod, name)
+                if alias isa Type && !has_free_typevars(alias) && !Base_print_without_params(alias)
+                    push!(candidates, (name, alias))
+                end
+            end
+        end
+        candidates
+    end
+end
+
 # ── make_typealias ──────────────────────────────────────────────────────
 function Base_make_typealias(@nospecialize(x::Type))
     Any === x && return nothing
@@ -93,32 +115,39 @@ function Base_make_typealias(@nospecialize(x::Type))
         p isa UnionAll && push!(xenv, p)
     end
     x isa UnionAll && push!(xenv, x)
+    # For a DataType, `applied === x` can only hold when the alias
+    # shares the same TypeName, so we can skip the expensive `x <: alias`
+    # subtyping check for every unrelated type constant in the module.
+    ux = unwrap_unionall(x)
+    x_tn = ux isa DataType ? ux.name : nothing
     for mod in mods
-        for name in unsorted_names(mod)
-            if isdefinedglobal(mod, name) && !isdeprecated(mod, name) && isconst(mod, name)
-                alias = getglobal(mod, name)
-                if alias isa Type && !has_free_typevars(alias) && !Base_print_without_params(alias) && x <: alias
-                    if alias isa UnionAll
-                        (ti, env) = ccall(:jl_type_intersection_with_env, Any, (Any, Any), x, alias)::SimpleVector
-                        env = env::SimpleVector
-                        applied = try
-                                alias{env...}
-                            catch ex
-                                ex isa TypeError || rethrow()
-                                continue
-                            end
-                        for p in xenv
-                            applied = rewrap_unionall(applied, p)
-                        end
-                        has_free_typevars(applied) && continue
-                        applied === x || continue
-                    elseif alias === x
-                        env = Core.svec()
-                    else
-                        continue
-                    end
-                    push!(aliases, (GlobalRef(mod, name), env))
+        for (name, alias) in _get_typealias_candidates(mod)
+            if !isdeprecated(mod, name)
+                if x_tn !== nothing
+                    ua = unwrap_unionall(alias)
+                    (ua isa DataType && ua.name === x_tn) || continue
                 end
+                x <: alias || continue
+                if alias isa UnionAll
+                    (ti, env) = ccall(:jl_type_intersection_with_env, Any, (Any, Any), x, alias)::SimpleVector
+                    env = env::SimpleVector
+                    applied = try
+                            alias{env...}
+                        catch ex
+                            ex isa TypeError || rethrow()
+                            continue
+                        end
+                    for p in xenv
+                        applied = rewrap_unionall(applied, p)
+                    end
+                    has_free_typevars(applied) && continue
+                    applied === x || continue
+                elseif alias === x
+                    env = Core.svec()
+                else
+                    continue
+                end
+                push!(aliases, (GlobalRef(mod, name), env))
             end
         end
     end
@@ -836,7 +865,9 @@ function Base_show_type(io::IO, @nospecialize(x::Type))
 end
 
 # ── repr ────────────────────────────────────────────────────────────────
-Base_repr(x; context=nothing) = sprint(Base_show, x; context=context)
+function Base_repr(x; context=nothing)
+    sprint(Base_show, x; context=context)
+end
 
 # ── sprint (re-export from Base for convenience) ────────────────────────
 const Base_sprint = sprint

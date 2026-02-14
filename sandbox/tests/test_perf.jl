@@ -43,5 +43,5 @@ foo10(t::Nested) = foo9(t)
 end
 
 using BenchmarkTools
-@btime Base.show(devnull, Dict{String, Any})
-# @btime Base_show(devnull, Dict{String, Any})
+# @btime Base.show(devnull, Dict{String, Any})
+@btime Base_show(devnull, Dict{String, Any})
